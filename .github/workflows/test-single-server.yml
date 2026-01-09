@@ -1,80 +1,272 @@
-name: Run Kaggle (Attempt T4 / Fallback P100)
+name: Kaggle Executor - Final Raw Fix
 
 on:
-  push:
   workflow_dispatch:
+  repository_dispatch:
+    types: [cron-trigger]
 
 jobs:
-  kaggle-execution:
+  execute-notebooks:
     runs-on: ubuntu-latest
     
     steps:
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.9'
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        pip install kaggle
+    
+    - name: Execute notebooks
+      run: |
+        python << 'PYEOF'
+        import os
+        import subprocess
+        import json
+        import sys
+        import re
+        from datetime import datetime
+        import shutil
+        import time
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-      - name: Install Kaggle CLI
-        run: pip install kaggle
+        # ========================================
+        # CONFIGURATION
+        # ========================================
+        FIREBASE_DATASET_REF = "shreevathsbbhh/firebase-credentials"
 
-      - name: Patch and Push Kernel
-        env:
-          KAGGLE_USERNAME: "shreevathsbbhh"
-          KAGGLE_KEY: "83a92caa96ed51b5d5a9a730100c57aa"
-        run: |
-          mkdir kaggle_run
-          cd kaggle_run
+        WEEKLY_SCHEDULE = {
+            "Friday": [
+                {"username": "shreevathsaz", "key": "2faa3199cb4f8a0d88a8999604ac6770"},
+                {"username": "shreevathsamm", "key": "613f3e396b629b0df65e65e35fe7b243"}
+            ],
+            "Saturday": [
+                {"username": "vathsam", "key": "f50456cea220739ad0ecb651e79593bd"},
+                {"username": "svproeditor", "key": "e423020355bbdd8a2a8b410587cec0cd"}
+            ],
+            "Sunday": [
+                {"username": "yamanya", "key": "6a8da12facf5fbcc820cd00baa788a99"},
+                {"username": "yamunappacom", "key": "d34212355d722ee3c75b8b6e06e2ce87"}
+            ],
+            "Monday": [
+                {"username": "vaishakha98", "key": "4240e8c91b5cd8537de55bad47554b5e"},
+                {"username": "riocom", "key": "79898aeec842d5ef19dd7acbd0c7f356"}
+            ],
+            "Tuesday": [
+                {"username": "leommmmm", "key": "c88472f292e5de46c97952906d79c896"}
+            ],
+            "Wednesday": [],
+            "Thursday": []
+        }
 
-          # 1. Pull the current code and metadata
-          kaggle kernels pull shreevathsbbhh/gpusss -m -p .
+        # ========================================
+        # HELPER FUNCTIONS
+        # ========================================
+        def log(msg, symbol="ℹ️"):
+            timestamp = datetime.utcnow().strftime('%H:%M:%S')
+            print(f"[{timestamp}] {symbol} {msg}")
+            sys.stdout.flush()
 
-          # 2. PYTHON SCRIPT: Force T4 Tags + Enable GPU
-          python3 -c '
-          import json
-          import glob
+        def setup_kaggle_auth(account):
+            kaggle_dir = os.path.join(os.path.expanduser("~"), ".kaggle")
+            os.makedirs(kaggle_dir, exist_ok=True)
+            kaggle_json = os.path.join(kaggle_dir, "kaggle.json")
+            with open(kaggle_json, 'w') as f:
+                json.dump({"username": account["username"], "key": account["key"]}, f)
+            os.chmod(kaggle_json, 0o600)
+            log(f"Auth set: {account['username']}", "🔑")
 
-          # --- Step A: Patch kernel-metadata.json ---
-          # We MUST have "enable_gpu": "true" or it goes to CPU.
-          # We also add "accelerator" keys, though API often ignores them.
-          try:
-              with open("kernel-metadata.json", "r") as f:
-                  meta = json.load(f)
-              
-              # CRITICAL: This enables the GPU (likely P100 due to API limits)
-              meta["enable_gpu"] = "true"
-              
-              # Best effort request for T4
-              meta["accelerator"] = "nvidiaTeslaT4"
-              meta["gpuAcceleratorType"] = "nvidiaTeslaT4"
-              
-              with open("kernel-metadata.json", "w") as f:
-                  json.dump(meta, f, indent=4)
-              print("Metadata patched: GPU Enabled.")
-          except Exception as e:
-              print(f"Metadata patch failed: {e}")
+        def run_cmd(cmd, timeout=180, cwd=None):
+            try:
+                result = subprocess.run(
+                    cmd, 
+                    shell=True, 
+                    stdout=subprocess.PIPE, 
+                    stderr=subprocess.PIPE, 
+                    text=True, 
+                    timeout=timeout, 
+                    cwd=cwd
+                )
+                return result.returncode == 0, result.stdout, result.stderr
+            except subprocess.TimeoutExpired:
+                return False, "", "Timeout"
+            except Exception as e:
+                return False, "", str(e)
 
-          # --- Step B: Patch notebook (.ipynb) internals ---
-          # This ensures the internal notebook file requests T4
-          nb_files = glob.glob("*.ipynb")
-          if nb_files:
-              nb_path = nb_files[0]
-              with open(nb_path, "r") as f:
-                  nb = json.load(f)
+        def inject_server_id_raw(notebook_path, server_id):
+            """
+            NUCLEAR OPTION:
+            Reads file as raw text and uses Regex to replace the specific line.
+            Does NOT add new cells. Modifies in-place.
+            Matches: SERVER_ID = "..." (and handles JSON escaped quotes)
+            """
+            try:
+                with open(notebook_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                
+                # Regex Explanation:
+                # SERVER_ID\s*=\s*    Finds 'SERVER_ID =' with any spacing
+                # \\?["']             Finds opening quote (optional backslash for JSON escape)
+                # .*?                 Matches content inside quotes
+                # \\?["']             Finds closing quote
+                # We replace the content inside quotes with our new ID
+                
+                pattern = r'(SERVER_ID\s*=\s*\\?["\']).*?(\\?["\'])'
+                replacement = f'\\g<1>{server_id}\\g<2>'
+                
+                new_content, count = re.subn(pattern, replacement, content)
+                
+                if count > 0:
+                    with open(notebook_path, 'w', encoding='utf-8') as f:
+                        f.write(new_content)
+                    return True, f"Replaced {count} occurrence(s)"
+                else:
+                    # Debug info if not found
+                    snippet_idx = content.find("SERVER_ID")
+                    snippet = content[snippet_idx:snippet_idx+50] if snippet_idx != -1 else "Not Found"
+                    return False, f"Pattern not found. Snippet: {snippet}"
+                    
+            except Exception as e:
+                return False, str(e)
 
-              if "metadata" not in nb: nb["metadata"] = {}
-              if "kaggle" not in nb["metadata"]: nb["metadata"]["kaggle"] = {}
+        def execute_notebook(account, notebook_name, dest_slug, server_id):
+            log(f"START: {notebook_name} → {account['username']}", "🚀")
+            log(f"  Target ID: {server_id}", "🎯")
+            
+            base_dir = os.getcwd()
+            work_dir = os.path.join(base_dir, f"work_{notebook_name}_{account['username']}")
+            
+            try:
+                # Clean directory
+                if os.path.exists(work_dir):
+                    shutil.rmtree(work_dir)
+                os.makedirs(work_dir)
+                
+                # STEP 1: Copy base notebook
+                base_notebook_path = os.path.join(base_dir, "gpuss.ipynb")
+                
+                if not os.path.exists(base_notebook_path):
+                    log(f"ERROR: gpuss.ipynb not found!", "❌")
+                    return False
+                
+                work_notebook_path = os.path.join(work_dir, f"{notebook_name}.ipynb")
+                shutil.copy(base_notebook_path, work_notebook_path)
+                
+                # STEP 2: RAW TEXT INJECTION
+                success, msg = inject_server_id_raw(work_notebook_path, server_id)
+                if success:
+                    log(f"✓ {msg} -> {server_id}", "💉")
+                else:
+                    log(f"❌ INJECTION FAILED: {msg}", "❌")
+                    # If we fail to replace, do NOT push, as it will run default ID
+                    return False
+                
+                # STEP 3: Create Metadata
+                metadata = {
+                    "id": dest_slug,
+                    "title": notebook_name, # Simple title to match slug
+                    "code_file": f"{notebook_name}.ipynb",
+                    "language": "python",
+                    "kernel_type": "notebook",
+                    "is_private": True,
+                    "enable_gpu": True,
+                    "enable_internet": True,
+                    "enable_tpu": False,
+                    "dataset_sources": [FIREBASE_DATASET_REF],
+                    "kernel_sources": [],
+                    "competition_sources": []
+                }
+                
+                metadata_path = os.path.join(work_dir, "kernel-metadata.json")
+                with open(metadata_path, 'w', encoding='utf-8') as f:
+                    json.dump(metadata, f, indent=2)
+                
+                # STEP 4: Push to Kaggle
+                setup_kaggle_auth(account)
+                
+                log("Pushing...", "📤")
+                success, stdout, stderr = run_cmd("kaggle kernels push", timeout=240, cwd=work_dir)
+                
+                if not success:
+                    log(f"PUSH FAILED: {stderr.strip()}", "❌")
+                    return False
+                
+                log(f"Push OK: https://www.kaggle.com/code/{dest_slug}", "✅")
+                return True
+                
+            except Exception as e:
+                log(f"EXCEPTION: {str(e)}", "❌")
+                return False
+            finally:
+                if os.path.exists(work_dir):
+                    try: shutil.rmtree(work_dir)
+                    except: pass
 
-              # Force T4 settings internally
-              nb["metadata"]["kaggle"]["accelerator"] = "nvidiaTeslaT4"
-              nb["metadata"]["kaggle"]["gpuAcceleratorType"] = "nvidiaTeslaT4"
-              nb["metadata"]["kaggle"]["isGpuEnabled"] = True
-              
-              with open(nb_path, "w") as f:
-                  json.dump(nb, f, indent=4)
-              print("Notebook file patched for T4.")
-          '
+        # ========================================
+        # MAIN EXECUTION
+        # ========================================
+        def execute_notebook_wrapper(args):
+            account, notebook_name, dest_slug, server_id, start_delay = args
+            if start_delay > 0: time.sleep(start_delay)
+            result_key = f"{account['username']}/{notebook_name}"
+            success = execute_notebook(account, notebook_name, dest_slug, server_id)
+            return (result_key, success)
+        
+        def execute_all():
+            start = datetime.utcnow()
+            current_day = datetime.utcnow().strftime('%A')
+            
+            log("═" * 70, "")
+            log(f"KAGGLE EXECUTOR - RAW TEXT REPLACEMENT", "🚀")
+            log("═" * 70, "")
+            
+            if current_day not in WEEKLY_SCHEDULE:
+                log(f"Error: Day {current_day} not found.", "❌")
+                sys.exit(1)
+            
+            accounts_today = WEEKLY_SCHEDULE[current_day]
+            if not accounts_today:
+                log(f"No accounts for {current_day}.", "⏭️")
+                sys.exit(0)
+            
+            log(f"Target: {len(accounts_today)} accounts", "👥")
+            
+            tasks = []
+            global_counter = 1 
+            task_delay_counter = 0
 
-          # 3. Push to Kaggle
-          # This will launch the run. 
-          # Note: If Kaggle gives P100, it is a server-side API limitation.
-          kaggle kernels push -p .
+            for account in accounts_today:
+                for _ in range(2):
+                    notebook_filename = f"server-{global_counter}" 
+                    server_var_id = f"server_{global_counter}"     
+                    dest_slug = f"{account['username']}/{notebook_filename}"
+                    delay = task_delay_counter * 3
+                    tasks.append((account, notebook_filename, dest_slug, server_var_id, delay))
+                    global_counter += 1
+                    task_delay_counter += 1
+            
+            log("═" * 70, "")
+            log(f"🚀 Launching {len(tasks)} notebooks...", "")
+            
+            results = {}
+            with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+                future_to_task = {executor.submit(execute_notebook_wrapper, task): task for task in tasks}
+                for future in as_completed(future_to_task):
+                    key, success = future.result()
+                    results[key] = success
+                    print(f"Result: {key} -> {'✅ Success' if success else '❌ Failed'}")
+
+            success_count = sum(results.values())
+            log("═" * 70, "")
+            log(f"SUMMARY: {success_count}/{len(tasks)} Successful", "🏁")
+            
+            if success_count < len(tasks):
+                sys.exit(1)
+
+        execute_all()
+        PYEOF
