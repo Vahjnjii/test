@@ -1,13 +1,11 @@
-name: Execute Kaggle Notebook
+name: Execute Kaggle Notebook (Force T4 GPU)
 
 on:
-  # Trigger when you save/push this file
   push:
-  # Also allows you to click a "Run" button manually in GitHub Actions tab
   workflow_dispatch:
 
 jobs:
-  trigger-new-version:
+  force-gpu-run:
     runs-on: ubuntu-latest
     
     steps:
@@ -19,19 +17,57 @@ jobs:
       - name: Install Kaggle CLI
         run: pip install kaggle
 
-      - name: Pull and Restart Kernel
+      - name: Pull, Patch, and Push Kernel
         env:
           KAGGLE_USERNAME: "shreevathsbbhh"
+          # ⚠️ Ensure this Key is valid. If you revoked the old one, update it here.
           KAGGLE_KEY: "83a92caa96ed51b5d5a9a730100c57aa"
         run: |
-          # Create a temporary folder to work in
+          # 1. Create directory and download current code
           mkdir kaggle_run
           cd kaggle_run
-
-          # 1. Download the current notebook and metadata directly from Kaggle
-          # -m gets the metadata, -p . saves to current folder
           kaggle kernels pull shreevathsbbhh/gpusss -m -p .
 
-          # 2. Push it back to Kaggle
-          # This forces Kaggle to start a "New Version" execution immediately
+          # 2. Python Script to FORCE T4 Metadata
+          # This reads the notebook and explicitly sets the accelerator to T4
+          python3 -c '
+          import json
+          import glob
+          import os
+
+          # Find the notebook file (usually gpusss.ipynb)
+          nb_files = glob.glob("*.ipynb")
+          if not nb_files:
+              print("Error: No notebook found.")
+              exit(1)
+          
+          nb_filename = nb_files[0]
+          print(f"Patching {nb_filename} for T4 GPU...")
+
+          with open(nb_filename, "r") as f:
+              nb = json.load(f)
+
+          # Ensure metadata structure exists
+          if "metadata" not in nb: nb["metadata"] = {}
+          if "kaggle" not in nb["metadata"]: nb["metadata"]["kaggle"] = {}
+
+          # --- THE FIX: FORCE T4 ACCELERATOR ---
+          # We inject specific internal keys that the API looks for
+          nb["metadata"]["kaggle"]["accelerator"] = "nvidiaTeslaT4"
+          nb["metadata"]["kaggle"]["gpuAcceleratorType"] = "nvidiaTeslaT4"
+          nb["metadata"]["kaggle"]["isGpuEnabled"] = True
+          
+          # Also patch the standard language_info if missing
+          if "language_info" not in nb["metadata"]:
+              nb["metadata"]["language_info"] = {"name": "python", "version": "3.10"}
+
+          # Save the patched notebook back to disk
+          with open(nb_filename, "w") as f:
+              json.dump(nb, f, indent=4)
+              
+          print("Notebook patched successfully.")
+          '
+
+          # 3. Push back to Kaggle
+          # This uploads the PATCHED notebook which tells Kaggle to use T4
           kaggle kernels push -p .
