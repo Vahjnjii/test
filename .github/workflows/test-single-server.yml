@@ -1,11 +1,11 @@
-name: Run Kaggle Notebook (Force T4 x2)
+name: Run Kaggle Notebook (Force T4 x2 Fix)
 
 on:
   push:
   workflow_dispatch:
 
 jobs:
-  force-gpu-t4-run:
+  force-gpu-t4-execution:
     runs-on: ubuntu-latest
     
     steps:
@@ -17,50 +17,65 @@ jobs:
       - name: Install Kaggle CLI
         run: pip install kaggle
 
-      - name: Force T4 Execution
+      - name: Advanced Patch and Push
         env:
           KAGGLE_USERNAME: "shreevathsbbhh"
-          KAGGLE_KEY: "83a92caa96ed51b5d5a9a730100c57aa"
+          # Ensure this is your valid, active key
+          KAGGLE_KEY: "83a92caa96ed51b5d5a9a730100c57aa" 
         run: |
           mkdir kaggle_run
           cd kaggle_run
 
-          # 1. Pull current code and metadata
+          # 1. Download the current version (Code + Metadata)
           kaggle kernels pull shreevathsbbhh/gpusss -m -p .
 
-          # 2. PATCH THE METADATA FILE (kernel-metadata.json)
-          # We manually inject the accelerator field which the CLI usually ignores
-          # jq is used here to safely insert the field
-          jq '. + {"accelerator": "nvidiaTeslaT4"}' kernel-metadata.json > kernel-metadata.json.tmp && mv kernel-metadata.json.tmp kernel-metadata.json
-
-          # 3. PATCH THE NOTEBOOK FILE (.ipynb)
-          # We use Python to inject the specific T4 keys into the notebook JSON
+          # 2. RUN PYTHON PATCHER
+          # This script modifies the files to trick the API into accepting T4
           python3 -c '
           import json
           import glob
+          import os
 
+          # --- PATCH 1: kernel-metadata.json ---
+          if os.path.exists("kernel-metadata.json"):
+              with open("kernel-metadata.json", "r") as f:
+                  meta = json.load(f)
+
+              # CRITICAL: Remove the generic "enable_gpu" flag if it exists.
+              # If this is present, the API defaults to P100.
+              # We want the API to rely on the "accelerator" field or existing settings.
+              if "enable_gpu" in meta:
+                  del meta["enable_gpu"]
+
+              # Inject specific T4 keys (Some are for V1 API, some for internal)
+              meta["accelerator"] = "nvidiaTeslaT4"
+              meta["gpuAcceleratorType"] = "nvidiaTeslaT4"
+              
+              with open("kernel-metadata.json", "w") as f:
+                  json.dump(meta, f, indent=4)
+              print("Metadata patched: Removed enable_gpu, added nvidiaTeslaT4.")
+
+          # --- PATCH 2: Notebook file (.ipynb) ---
           nb_files = glob.glob("*.ipynb")
           if nb_files:
-              filename = nb_files[0]
-              print(f"Patching {filename}...")
-              
-              with open(filename, "r") as f:
-                  data = json.load(f)
+              nb_path = nb_files[0]
+              with open(nb_path, "r") as f:
+                  nb = json.load(f)
 
-              # Create metadata path if missing
-              if "metadata" not in data: data["metadata"] = {}
-              if "kaggle" not in data["metadata"]: data["metadata"]["kaggle"] = {}
+              # Ensure structure
+              if "metadata" not in nb: nb["metadata"] = {}
+              if "kaggle" not in nb["metadata"]: nb["metadata"]["kaggle"] = {}
 
-              # FORCE T4 CONFIGURATION
-              # "nvidiaTeslaT4" usually activates T4 x2 on Kaggle (as single T4 is rarely an option)
-              data["metadata"]["kaggle"]["accelerator"] = "nvidiaTeslaT4"
-              data["metadata"]["kaggle"]["gpuAcceleratorType"] = "nvidiaTeslaT4"
-              data["metadata"]["kaggle"]["isGpuEnabled"] = True
+              # Force internal notebook settings
+              nb["metadata"]["kaggle"]["accelerator"] = "nvidiaTeslaT4"
+              nb["metadata"]["kaggle"]["gpuAcceleratorType"] = "nvidiaTeslaT4"
+              nb["metadata"]["kaggle"]["isGpuEnabled"] = True
               
-              with open(filename, "w") as f:
-                  json.dump(data, f, indent=4)
-              print("Patch applied.")
+              with open(nb_path, "w") as f:
+                  json.dump(nb, f, indent=4)
+              print(f"Notebook {nb_path} patched with T4 settings.")
           '
 
-          # 4. Push the patched files
+          # 3. Push to Kaggle
+          # We use the CLI but with our surgically altered files
           kaggle kernels push -p .
