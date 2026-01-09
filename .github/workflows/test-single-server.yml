@@ -1,118 +1,37 @@
-name: Test Single Server
+name: Execute Kaggle Notebook
 
 on:
-  workflow_dispatch:  # Click "Run workflow" button to trigger
+  # Trigger when you save/push this file
+  push:
+  # Also allows you to click a "Run" button manually in GitHub Actions tab
+  workflow_dispatch:
 
 jobs:
-  launch-test-server:
+  trigger-new-version:
     runs-on: ubuntu-latest
     
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
-    
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.10'
-    
-    - name: Install Kaggle
-      run: pip install kaggle
-    
-    - name: Launch Single Notebook
-      run: |
-        python << 'PYEOF'
-        import os
-        import subprocess
-        import json
-        import re
-        import shutil
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
 
-        # ========================================
-        # CONFIGURATION
-        # ========================================
-        ACCOUNT_USERNAME = "shreevathsaz"
-        ACCOUNT_KEY = "2faa3199cb4f8a0d88a8999604ac6770"
-        SERVER_ID = "server_1"
-        NOTEBOOK_NAME = "test-server"
-        FIREBASE_DATASET = "shreevathsbbhh/firebase-credentials"
+      - name: Install Kaggle CLI
+        run: pip install kaggle
 
-        # ========================================
-        # SETUP KAGGLE AUTH
-        # ========================================
-        kaggle_dir = os.path.expanduser("~/.kaggle")
-        os.makedirs(kaggle_dir, exist_ok=True)
-        with open(f"{kaggle_dir}/kaggle.json", 'w') as f:
-            json.dump({"username": ACCOUNT_USERNAME, "key": ACCOUNT_KEY}, f)
-        os.chmod(f"{kaggle_dir}/kaggle.json", 0o600)
-        print(f"✅ Kaggle auth: {ACCOUNT_USERNAME}")
+      - name: Pull and Restart Kernel
+        env:
+          KAGGLE_USERNAME: "shreevathsbbhh"
+          KAGGLE_KEY: "83a92caa96ed51b5d5a9a730100c57aa"
+        run: |
+          # Create a temporary folder to work in
+          mkdir kaggle_run
+          cd kaggle_run
 
-        # ========================================
-        # PREPARE NOTEBOOK
-        # ========================================
-        work_dir = "work_test"
-        if os.path.exists(work_dir):
-            shutil.rmtree(work_dir)
-        os.makedirs(work_dir)
+          # 1. Download the current notebook and metadata directly from Kaggle
+          # -m gets the metadata, -p . saves to current folder
+          kaggle kernels pull shreevathsbbhh/gpusss -m -p .
 
-        # Copy base notebook
-        base_notebook = "gpuss.ipynb"
-        work_notebook = f"{work_dir}/{NOTEBOOK_NAME}.ipynb"
-        shutil.copy(base_notebook, work_notebook)
-        print(f"✅ Copied: {base_notebook} → {work_notebook}")
-
-        # Inject SERVER_ID
-        with open(work_notebook, 'r', encoding='utf-8') as f:
-            content = f.read()
-        
-        pattern = r'(SERVER_ID\s*=\s*\\?["\']).*?(\\?["\'])'
-        replacement = f'\\g<1>{SERVER_ID}\\g<2>'
-        content = re.sub(pattern, replacement, content)
-        
-        with open(work_notebook, 'w', encoding='utf-8') as f:
-            f.write(content)
-        print(f"✅ Injected SERVER_ID: {SERVER_ID}")
-
-        # Create metadata
-        metadata = {
-            "id": f"{ACCOUNT_USERNAME}/{NOTEBOOK_NAME}",
-            "title": NOTEBOOK_NAME,
-            "code_file": f"{NOTEBOOK_NAME}.ipynb",
-            "language": "python",
-            "kernel_type": "notebook",
-            "is_private": True,
-            "enable_gpu": True,
-            "enable_internet": True,
-            "enable_tpu": False,
-            "dataset_sources": [FIREBASE_DATASET],
-            "kernel_sources": [],
-            "competition_sources": []
-        }
-        
-        with open(f"{work_dir}/kernel-metadata.json", 'w') as f:
-            json.dump(metadata, f, indent=2)
-        print(f"✅ Metadata created")
-
-        # ========================================
-        # PUSH TO KAGGLE
-        # ========================================
-        print(f"\\n🚀 Pushing to Kaggle...")
-        result = subprocess.run(
-            "kaggle kernels push",
-            shell=True,
-            cwd=work_dir,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-
-        if result.returncode == 0:
-            print(f"✅ SUCCESS!")
-            print(f"📊 URL: https://www.kaggle.com/code/{ACCOUNT_USERNAME}/{NOTEBOOK_NAME}")
-        else:
-            print(f"❌ FAILED!")
-            print(result.stderr)
-
-        # Cleanup
-        shutil.rmtree(work_dir)
-        PYEOF
+          # 2. Push it back to Kaggle
+          # This forces Kaggle to start a "New Version" execution immediately
+          kaggle kernels push -p .
