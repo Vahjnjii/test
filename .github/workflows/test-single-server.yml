@@ -1,11 +1,11 @@
-name: Run Kaggle Notebook (Force T4 x2 Fix)
+name: Run Kaggle (Attempt T4 / Fallback P100)
 
 on:
   push:
   workflow_dispatch:
 
 jobs:
-  force-gpu-t4-execution:
+  kaggle-execution:
     runs-on: ubuntu-latest
     
     steps:
@@ -17,65 +17,64 @@ jobs:
       - name: Install Kaggle CLI
         run: pip install kaggle
 
-      - name: Advanced Patch and Push
+      - name: Patch and Push Kernel
         env:
           KAGGLE_USERNAME: "shreevathsbbhh"
-          # Ensure this is your valid, active key
-          KAGGLE_KEY: "83a92caa96ed51b5d5a9a730100c57aa" 
+          KAGGLE_KEY: "83a92caa96ed51b5d5a9a730100c57aa"
         run: |
           mkdir kaggle_run
           cd kaggle_run
 
-          # 1. Download the current version (Code + Metadata)
+          # 1. Pull the current code and metadata
           kaggle kernels pull shreevathsbbhh/gpusss -m -p .
 
-          # 2. RUN PYTHON PATCHER
-          # This script modifies the files to trick the API into accepting T4
+          # 2. PYTHON SCRIPT: Force T4 Tags + Enable GPU
           python3 -c '
           import json
           import glob
-          import os
 
-          # --- PATCH 1: kernel-metadata.json ---
-          if os.path.exists("kernel-metadata.json"):
+          # --- Step A: Patch kernel-metadata.json ---
+          # We MUST have "enable_gpu": "true" or it goes to CPU.
+          # We also add "accelerator" keys, though API often ignores them.
+          try:
               with open("kernel-metadata.json", "r") as f:
                   meta = json.load(f)
-
-              # CRITICAL: Remove the generic "enable_gpu" flag if it exists.
-              # If this is present, the API defaults to P100.
-              # We want the API to rely on the "accelerator" field or existing settings.
-              if "enable_gpu" in meta:
-                  del meta["enable_gpu"]
-
-              # Inject specific T4 keys (Some are for V1 API, some for internal)
+              
+              # CRITICAL: This enables the GPU (likely P100 due to API limits)
+              meta["enable_gpu"] = "true"
+              
+              # Best effort request for T4
               meta["accelerator"] = "nvidiaTeslaT4"
               meta["gpuAcceleratorType"] = "nvidiaTeslaT4"
               
               with open("kernel-metadata.json", "w") as f:
                   json.dump(meta, f, indent=4)
-              print("Metadata patched: Removed enable_gpu, added nvidiaTeslaT4.")
+              print("Metadata patched: GPU Enabled.")
+          except Exception as e:
+              print(f"Metadata patch failed: {e}")
 
-          # --- PATCH 2: Notebook file (.ipynb) ---
+          # --- Step B: Patch notebook (.ipynb) internals ---
+          # This ensures the internal notebook file requests T4
           nb_files = glob.glob("*.ipynb")
           if nb_files:
               nb_path = nb_files[0]
               with open(nb_path, "r") as f:
                   nb = json.load(f)
 
-              # Ensure structure
               if "metadata" not in nb: nb["metadata"] = {}
               if "kaggle" not in nb["metadata"]: nb["metadata"]["kaggle"] = {}
 
-              # Force internal notebook settings
+              # Force T4 settings internally
               nb["metadata"]["kaggle"]["accelerator"] = "nvidiaTeslaT4"
               nb["metadata"]["kaggle"]["gpuAcceleratorType"] = "nvidiaTeslaT4"
               nb["metadata"]["kaggle"]["isGpuEnabled"] = True
               
               with open(nb_path, "w") as f:
                   json.dump(nb, f, indent=4)
-              print(f"Notebook {nb_path} patched with T4 settings.")
+              print("Notebook file patched for T4.")
           '
 
           # 3. Push to Kaggle
-          # We use the CLI but with our surgically altered files
+          # This will launch the run. 
+          # Note: If Kaggle gives P100, it is a server-side API limitation.
           kaggle kernels push -p .
